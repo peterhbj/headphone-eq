@@ -1,0 +1,202 @@
+#!/usr/bin/env python3
+"""Finds the connected headphones in AutoEq and sets up their correction.
+
+Takes the name of the audio output in use (for bluetooth, the name the
+headphones announce), looks it up in AutoEq's index, downloads the
+ParametricEQ.txt, registers the device in devices.json, writes the Easy
+Effects autoload rule for that output and loads the preset.
+
+Usage:
+  autoeq-setup                      detect the output and set it up
+  autoeq-setup --list               only show what AutoEq has for it
+  autoeq-setup --pick 2             use the 2nd candidate from --list
+  autoeq-setup --name "Sony WH-1000XM4" --sink bluez_output.XX.1
+"""
+import argparse
+import difflib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.parse
+import urllib.request
+
+RESULTS = "https://raw.githubusercontent.com/jaakkopasanen/AutoEq/master/results"
+CACHE = os.path.expanduser("~/.cache/autoeq/INDEX.md")
+PROFILES = os.path.expanduser("~/.local/share/autoeq-profiles")
+DEVICES = os.path.join(PROFILES, "devices.json")
+EE = os.path.expanduser("~/.local/share/easyeffects")
+WIDGET = os.path.expanduser("~/.local/share/serpantinum/src/quickshell/media")
+HERE = os.path.dirname(os.path.realpath(__file__))
+# AutoEq's own preference between measurement sources, best first.
+SOURCES = ["oratory1990", "crinacle", "Rtings", "Innerfidelity", "Headphone.com Legacy"]
+# What PipeWire appends to a device's name.
+SUFFIXES = r"\s+(analog|digital|pro)?\s*(stereo|mono|surround.*|output|headphones?|headset)$"
+
+
+def sinks():
+    return json.loads(subprocess.run(["pactl", "-f", "json", "list", "sinks"],
+                                     capture_output=True, text=True, check=True).stdout)
+
+
+def output_sink(name=None):
+    """The sink being listened to. With Easy Effects as default, the first
+    external one (bluetooth or USB), since that is where it plays."""
+    all_sinks = sinks()
+    if name:
+        return next((s for s in all_sinks if s["name"] == name), None) or sys.exit(f"sink {name} não existe")
+    default = subprocess.run(["pactl", "get-default-sink"], capture_output=True, text=True).stdout.strip()
+    real = [s for s in all_sinks if s["name"] != "easyeffects_sink"]
+    current = next((s for s in real if s["name"] == default), None)
+    external = [s for s in real if s["properties"].get("device.bus") in ("bluetooth", "usb")]
+    return current or next(iter(external), None)
+
+
+def device_name(sink):
+    return re.sub(SUFFIXES, "", sink["description"], flags=re.I).strip()
+
+
+def index(refresh):
+    if refresh or not os.path.exists(CACHE) or time.time() - os.path.getmtime(CACHE) > 7 * 86400:
+        os.makedirs(os.path.dirname(CACHE), exist_ok=True)
+        with urllib.request.urlopen(f"{RESULTS}/INDEX.md", timeout=30) as r:
+            atomic_write(CACHE, r.read().decode())
+    entries = []
+    for line in open(CACHE):
+        if m := re.match(r"- \[(.+)\]\(\./(.+)\) by (.+)", line):
+            entries.append({"name": m[1], "path": urllib.parse.unquote(m[2]), "source": m[3].strip()})
+    return entries
+
+
+def norm(s):
+    return " ".join(re.sub(r"[^a-z0-9]+", " ", s.lower()).split())
+
+
+def score(query, entry):
+    base = norm(re.sub(r"\(.*?\)", "", entry["name"]))
+    q = norm(query)
+    if base == q:
+        return 1.0
+    if base.replace(" ", "") == q.replace(" ", ""):
+        return 0.95
+    # "WH-1000XM4" from bluetooth vs "Sony WH-1000XM4" in AutoEq.
+    if set(q.split()) <= set(base.split()):
+        return 0.9
+    return difflib.SequenceMatcher(None, q, base).ratio()
+
+
+def candidates(query, entries):
+    def rank(e):
+        source = next((i for i, s in enumerate(SOURCES) if e["source"].startswith(s)), len(SOURCES))
+        return (-e["score"], "(" in e["name"], source)
+
+    found = [dict(e, score=score(query, e)) for e in entries]
+    return sorted((e for e in found if e["score"] >= 0.7), key=rank)
+
+
+def slug(name):
+    return re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
+
+
+def atomic_write(path, text):
+    # Easy Effects watches its folders and once crashed reading a half-written file.
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".tmp.")
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
+def download(entry):
+    leaf = os.path.basename(entry["path"])
+    url = f"{RESULTS}/{urllib.parse.quote(entry['path'])}/{urllib.parse.quote(leaf + ' ParametricEQ.txt')}"
+    with urllib.request.urlopen(url, timeout=30) as r:
+        text = r.read().decode()
+    if "Filter 1:" not in text:
+        sys.exit(f"perfil inesperado em {url}")
+    path = os.path.join(PROFILES, f"{leaf} ParametricEQ.txt")
+    atomic_write(path, text)
+    return path, text
+
+
+def register(sink, entry, profile):
+    devices = json.load(open(DEVICES)) if os.path.exists(DEVICES) else {}
+    key = re.sub(r"\.\d+$", "", sink["name"]) if sink["name"].startswith("bluez_") else sink["name"]
+    preset = devices.get(key, {}).get("preset") or f"live_eq_{slug(entry['name'])}"
+    devices[key] = {"name": entry["name"], "source": entry["source"],
+                    "profile": os.path.basename(profile), "preset": preset}
+    atomic_write(DEVICES, json.dumps(devices, indent=4, ensure_ascii=False) + "\n")
+    return preset
+
+
+def autoload(sink, preset):
+    port = sink.get("active_port") or ""
+    os.makedirs(f"{EE}/autoload/output", exist_ok=True)
+    rule = {"device": sink["name"], "device-description": sink["description"],
+            "device-profile": port, "preset-name": preset}
+    atomic_write(f"{EE}/autoload/output/{sink['name']}:{port}.json", json.dumps(rule, indent=4) + "\n")
+
+
+def apply():
+    """Regenerates every preset through the widget, so the sliders stay as they are."""
+    widget = os.path.join(WIDGET, "equalizer.sh")
+    if os.path.exists(widget) and os.path.exists(os.path.join(WIDGET, "eq_preset.py")):
+        subprocess.run([widget, "apply"], check=True)
+        return
+    os.makedirs(f"{EE}/output", exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", suffix=".json") as flat:
+        json.dump({f"b{i}": 0 for i in range(1, 11)}, flat)
+        flat.flush()
+        preset = subprocess.run([sys.executable, os.path.join(HERE, "widget", "eq_preset.py"), flat.name,
+                                 f"{EE}/output", DEVICES], capture_output=True, text=True, check=True).stdout.strip()
+    if shutil.which("easyeffects"):
+        subprocess.run(["setsid", "-f", "easyeffects", "-l", preset],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def main():
+    p = argparse.ArgumentParser(description="Procura o fone conectado no AutoEq e prepara a correção no EasyEffects.")
+    p.add_argument("--name", help="nome do fone para procurar (padrão: nome do dispositivo de saída)")
+    p.add_argument("--sink", help="sink do PipeWire (padrão: a saída em uso)")
+    p.add_argument("--list", action="store_true", help="só lista os perfis encontrados")
+    p.add_argument("--pick", type=int, default=1, help="qual candidato usar (número do --list)")
+    p.add_argument("--refresh", action="store_true", help="baixa o índice do AutoEq de novo")
+    p.add_argument("--no-apply", action="store_true", help="baixa e registra, mas não carrega no EasyEffects")
+    args = p.parse_args()
+
+    sink = output_sink(args.sink)
+    if not sink and not (args.name and args.list):
+        sys.exit("nenhuma saída de áudio encontrada; conecte o fone ou use --sink")
+    query = args.name or device_name(sink)
+    if sink:
+        print(f"saída: {sink['name']} ({sink['description']})")
+    print(f"procurando no AutoEq: {query}")
+
+    found = candidates(query, index(args.refresh))
+    if not found:
+        sys.exit(f"nada parecido com '{query}' no AutoEq; tente --name com o modelo exato")
+    if args.list or args.pick > len(found):
+        for i, e in enumerate(found[:15], 1):
+            print(f"{i:3}. {e['name']}  —  {e['source']}")
+        return
+    entry = found[args.pick - 1]
+    if entry["score"] < 1.0 and args.pick == 1:
+        print(f"aviso: '{query}' não bate exato; usando o mais próximo. Confira com --list.", file=sys.stderr)
+    print(f"perfil: {entry['name']} — {entry['source']}")
+
+    os.makedirs(PROFILES, exist_ok=True)
+    profile, text = download(entry)
+    print(text.strip())
+    preset = register(sink, entry, profile)
+    autoload(sink, preset)
+    print(f"preset {preset}, autoload para {sink['name']}")
+    if not args.no_apply:
+        apply()
+        print("pronto: correção carregada no EasyEffects")
+
+
+if __name__ == "__main__":
+    main()
